@@ -100,6 +100,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   int quiet = 0;
   int expose_authtok = 0;
   int use_stdout = 0;
+  int pipe_stdin = 0;
   int optargc;
   const char *logfile = NULL;
   char authtok[PAM_MAX_RESP_SIZE] = {};
@@ -162,49 +163,15 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	  expose_authtok = 0;
 	}
       else
+        pipe_stdin = 1;
+    }
+
+  if (pipe_stdin)
+    {
+      if (pipe(fds) != 0)
 	{
-	  const void *void_pass;
-	  int retval;
-
-	  retval = pam_get_item (pamh, PAM_AUTHTOK, &void_pass);
-	  if (retval != PAM_SUCCESS)
-	    {
-	      if (debug)
-		pam_syslog (pamh, LOG_DEBUG,
-			    "pam_get_item (PAM_AUTHTOK) failed, return %d",
-			    retval);
-	      return retval;
-	    }
-	  else if (void_pass == NULL)
-	    {
-	      char *resp = NULL;
-
-	      retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
-				   &resp, _("Password: "));
-
-	      if (retval != PAM_SUCCESS)
-		{
-		  _pam_drop (resp);
-		  if (retval == PAM_CONV_AGAIN)
-		    retval = PAM_INCOMPLETE;
-		  return retval;
-		}
-
-	      if (resp)
-		{
-		  pam_set_item (pamh, PAM_AUTHTOK, resp);
-		  strncpy (authtok, resp, sizeof(authtok) - 1);
-		  _pam_drop (resp);
-		}
-	    }
-	  else
-	    strncpy (authtok, void_pass, sizeof(authtok) - 1);
-
-	  if (pipe(fds) != 0)
-	    {
-	      pam_syslog (pamh, LOG_ERR, "Could not create pipe: %m");
-	      return PAM_SYSTEM_ERR;
-	    }
+	  pam_syslog (pamh, LOG_ERR, "Could not create pipe: %m");
+	  return PAM_SYSTEM_ERR;
 	}
     }
 
@@ -234,24 +201,76 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   if (pid > 0) /* parent */
     {
       int status = 0;
+      int was_error = PAM_SUCCESS;
       pid_t retval;
+
+      if (use_stdout)
+        close(stdout_fds[1]);
 
       if (expose_authtok) /* send the password to the child */
 	{
-	  if (debug)
-	    pam_syslog (pamh, LOG_DEBUG, "send password to child");
-	  if (write(fds[1], authtok, strlen(authtok)) == -1)
-	    pam_syslog (pamh, LOG_ERR,
-			      "sending password to child failed: %m");
+          do /* to handle errors */
+	    {
+              const void *void_pass = NULL;
+
+              retval = pam_get_item (pamh, PAM_AUTHTOK, &void_pass);
+              if (retval != PAM_SUCCESS)
+                {
+                  if (debug)
+                    pam_syslog (pamh, LOG_DEBUG,
+                                "pam_get_item (PAM_AUTHTOK) failed, return %d",
+                                retval);
+                  was_error = retval;
+                  break;
+                }
+
+              if (void_pass == NULL)
+                {
+                  char *resp = NULL;
+
+                  retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
+                                       &resp, _("Password: "));
+
+                  if (retval != PAM_SUCCESS)
+                    {
+                      _pam_drop (resp);
+                      if (retval == PAM_CONV_AGAIN)
+                        retval = PAM_INCOMPLETE;
+                      was_error = retval;
+                      break;
+                    }
+
+                  if (resp)
+                    {
+                      pam_set_item (pamh, PAM_AUTHTOK, resp);
+                      strncpy (authtok, resp, sizeof(authtok) - 1);
+                      _pam_drop (resp);
+                    }
+                }
+              else
+                strncpy (authtok, void_pass, sizeof(authtok) - 1);
+
+              /* send authtok to child */
+
+              if (debug)
+                pam_syslog (pamh, LOG_DEBUG, "send password to child");
+              if (write(fds[1], authtok, strlen(authtok)) == -1)
+                {
+                  pam_syslog (pamh, LOG_ERR,
+                                    "sending password to child failed: %m");
+                  was_error = PAM_SYSTEM_ERR;
+                  break;
+                }
+            }
+          while (0);
 
           close(fds[0]);       /* close here to avoid possible SIGPIPE above */
           close(fds[1]);
 	}
 
-      if (use_stdout)
+      if (was_error == PAM_SUCCESS && use_stdout)
 	{
 	  char buf[4096];
-	  close(stdout_fds[1]);
 	  while (fgets(buf, sizeof(buf), stdout_file) != NULL)
 	    {
 	      size_t len;
@@ -268,7 +287,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       if (retval == (pid_t)-1)
 	{
 	  pam_syslog (pamh, LOG_ERR, "waitpid returns with -1: %m");
-	  return PAM_SYSTEM_ERR;
+	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
 	}
       else if (status != 0)
 	{
@@ -279,6 +298,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 		if (!quiet)
 	      pam_error (pamh, _("%s failed: exit code %d"),
 			 argv[optargc], WEXITSTATUS(status));
+              was_error = PAM_PERM_DENIED;
 	    }
 	  else if (WIFSIGNALED(status))
 	    {
@@ -298,9 +318,9 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	      pam_error (pamh, _("%s failed: unknown status 0x%x"),
 			 argv[optargc], status);
 	    }
-	  return PAM_SYSTEM_ERR;
+	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
 	}
-      return PAM_SUCCESS;
+      return was_error;
     }
   else /* child */
     {
@@ -310,14 +330,14 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       int envlen, nitems;
       char *envstr;
       enum pam_modutil_redirect_fd redirect_stdin =
-	      expose_authtok ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_PIPE_FD;
+	      pipe_stdin ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_PIPE_FD;
       enum pam_modutil_redirect_fd redirect_stdout =
 	      (use_stdout || logfile) ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_NULL_FD;
 
       /* First, move all the pipes off of stdin, stdout, and stderr, to ensure
        * that calls to dup2 won't close them. */
 
-      if (expose_authtok)
+      if (pipe_stdin)
 	{
 	  fds[0] = move_fd_to_non_stdio(pamh, fds[0]);
 	  close(fds[1]);
@@ -331,7 +351,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 
       /* Set up stdin. */
 
-      if (expose_authtok)
+      if (pipe_stdin)
 	{
 	  /* reopen stdin as pipe */
 	  if (dup2(fds[0], STDIN_FILENO) == -1)
