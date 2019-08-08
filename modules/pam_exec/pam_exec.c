@@ -107,6 +107,8 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   int fds[2];
   int stdout_fds[2];
   FILE *stdout_file = NULL;
+  int retval;
+  const char *name;
 
   if (argc < 1) {
     pam_syslog (pamh, LOG_ERR,
@@ -138,6 +140,17 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	expose_authtok = 1;
       else
 	break; /* Unknown option, assume program to execute. */
+    }
+
+  if (strcmp (pam_type, "auth") == 0)
+    {
+      retval = pam_get_user(pamh, &name, NULL);
+      if (retval != PAM_SUCCESS)
+        {
+          if (retval == PAM_CONV_AGAIN)
+            retval = PAM_INCOMPLETE;
+          return retval;
+        }
     }
 
   if (expose_authtok == 1)
