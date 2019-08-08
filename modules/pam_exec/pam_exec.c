@@ -100,6 +100,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   int quiet = 0;
   int expose_authtok = 0;
   int use_stdout = 0;
+  int use_prompt = 0;
   int pipe_stdin = 0;
   int optargc;
   const char *logfile = NULL;
@@ -126,6 +127,8 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	debug = 1;
       else if (strcasecmp (argv[optargc], "stdout") == 0)
 	use_stdout = 1;
+      else if (strcasecmp (argv[optargc], "prompt") == 0)
+        use_prompt = 1;
       else if (strncasecmp (argv[optargc], "log=", 4) == 0)
 	logfile = &argv[optargc][4];
       else if (strncasecmp (argv[optargc], "type=", 5) == 0)
@@ -154,7 +157,30 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
         }
     }
 
-  if (expose_authtok == 1)
+  if (use_prompt)
+    {
+      if (strcmp (pam_type, "auth") != 0)
+        {
+          pam_syslog (pamh, LOG_ERR,
+                      "prompt not supported for type %s", pam_type);
+          use_prompt = 0;
+        }
+      else if (expose_authtok)
+        {
+          pam_syslog (pamh, LOG_ERR,
+                      "prompt is not supported with expose_authtok");
+          use_prompt = 0;
+        }
+      else if (!use_stdout)
+        {
+          pam_syslog (pamh, LOG_ERR, "prompt requires stdout mode");
+          use_prompt = 0;
+        }
+      else
+        pipe_stdin = 1;
+    }
+
+  if (expose_authtok)
     {
       if (strcmp (pam_type, "auth") != 0)
 	{
@@ -202,34 +228,69 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
     {
       int status = 0;
       int was_error = PAM_SUCCESS;
-      pid_t retval;
+      pid_t retchild;
+      char prompt[PAM_MAX_RESP_SIZE];
 
       if (use_stdout)
         close(stdout_fds[1]);
 
-      if (expose_authtok) /* send the password to the child */
-	{
+      if (use_prompt) /* get challenge prompt from child */
+        {
+          if (fgets(prompt, sizeof(prompt), stdout_file) == NULL)
+            {
+              pam_syslog (pamh, LOG_ERR,
+                          "failed reading prompt from child: %m");
+              was_error = PAM_PERM_DENIED;
+            }
+          else
+            {
+              size_t len;
+              len = strlen(prompt);
+              if (prompt[len-1] != '\n')
+                {
+                  pam_syslog (pamh, LOG_ERR,
+                              "prompt from child too long: %m");
+                  was_error = PAM_SYSTEM_ERR;
+                }
+              else
+                prompt[len-1] = '\0';
+            }
+        }
+
+      if (was_error == PAM_SUCCESS && pipe_stdin) /* prompt and send the password to the child */
+        {
           do /* to handle errors */
-	    {
+            {
               const void *void_pass = NULL;
 
-              retval = pam_get_item (pamh, PAM_AUTHTOK, &void_pass);
-              if (retval != PAM_SUCCESS)
+              /* check existing authtok */
+
+              if (expose_authtok)
                 {
-                  if (debug)
-                    pam_syslog (pamh, LOG_DEBUG,
-                                "pam_get_item (PAM_AUTHTOK) failed, return %d",
-                                retval);
-                  was_error = retval;
-                  break;
+                  retval = pam_get_item (pamh, PAM_AUTHTOK, &void_pass);
+                  if (retval != PAM_SUCCESS)
+                    {
+                      if (debug)
+                        pam_syslog (pamh, LOG_DEBUG,
+                                    "pam_get_item (PAM_AUTHTOK) failed, return %d",
+                                    retval);
+                      was_error = retval;
+                      break;
+                    }
                 }
+
+              /* prompt for authtok */
 
               if (void_pass == NULL)
                 {
                   char *resp = NULL;
 
-                  retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
-                                       &resp, _("Password: "));
+                  if (use_prompt)
+                    retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
+                                         &resp, "%s: ", prompt);
+                  else
+                    retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
+                                         &resp, _("Password: "));
 
                   if (retval != PAM_SUCCESS)
                     {
@@ -242,7 +303,8 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 
                   if (resp)
                     {
-                      pam_set_item (pamh, PAM_AUTHTOK, resp);
+                      if (!use_prompt)
+                        pam_set_item (pamh, PAM_AUTHTOK, resp);
                       strncpy (authtok, resp, sizeof(authtok) - 1);
                       _pam_drop (resp);
                     }
@@ -282,9 +344,9 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	  fclose(stdout_file);
 	}
 
-      while ((retval = waitpid (pid, &status, 0)) == -1 &&
+      while ((retchild = waitpid (pid, &status, 0)) == -1 &&
 	     errno == EINTR);
-      if (retval == (pid_t)-1)
+      if (retchild == (pid_t)-1)
 	{
 	  pam_syslog (pamh, LOG_ERR, "waitpid returns with -1: %m");
 	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
