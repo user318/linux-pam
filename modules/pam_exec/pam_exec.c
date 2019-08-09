@@ -101,6 +101,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   int quiet = 0;
   int expose_authtok = 0;
   int use_stdout = 0;
+  int pipe_stdin = 0;
   int optargc;
   const char *logfile = NULL;
   char authtok[PAM_MAX_RESP_SIZE] = {};
@@ -167,6 +168,8 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	{
 	  const void *void_pass;
 
+          pipe_stdin = 1;
+
 	  retval = pam_get_item (pamh, PAM_AUTHTOK, &void_pass);
 	  if (retval != PAM_SUCCESS)
 	    {
@@ -200,13 +203,16 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	    }
 	  else
 	    strncpy (authtok, void_pass, sizeof(authtok) - 1);
-
-	  if (pipe(fds) != 0)
-	    {
-	      pam_syslog (pamh, LOG_ERR, "Could not create pipe: %m");
-	      return PAM_SYSTEM_ERR;
-	    }
 	}
+    }
+
+  if (pipe_stdin)
+    {
+      if (pipe(fds) != 0)
+        {
+          pam_syslog (pamh, LOG_ERR, "Could not create pipe: %m");
+          return PAM_SYSTEM_ERR;
+        }
     }
 
   if (use_stdout)
@@ -237,6 +243,9 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       int status = 0;
       pid_t rc;
 
+      if (use_stdout)
+        close(stdout_fds[1]);
+
       if (expose_authtok) /* send the password to the child */
 	{
 	  if (debug)
@@ -252,7 +261,6 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       if (use_stdout)
 	{
 	  char buf[4096];
-	  close(stdout_fds[1]);
 	  while (fgets(buf, sizeof(buf), stdout_file) != NULL)
 	    {
 	      size_t len;
@@ -263,6 +271,12 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	    }
 	  fclose(stdout_file);
 	}
+
+      if (pipe_stdin && !expose_authtok) /* expose_authtok closes fds above */
+        {
+          close(fds[0]);       /* close here to avoid possible SIGPIPE above */
+          close(fds[1]);
+        }
 
       while ((rc = waitpid (pid, &status, 0)) == -1 &&
 	     errno == EINTR);
@@ -311,14 +325,14 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       int envlen, nitems;
       char *envstr;
       enum pam_modutil_redirect_fd redirect_stdin =
-	      expose_authtok ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_PIPE_FD;
+	      pipe_stdin ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_PIPE_FD;
       enum pam_modutil_redirect_fd redirect_stdout =
 	      (use_stdout || logfile) ? PAM_MODUTIL_IGNORE_FD : PAM_MODUTIL_NULL_FD;
 
       /* First, move all the pipes off of stdin, stdout, and stderr, to ensure
        * that calls to dup2 won't close them. */
 
-      if (expose_authtok)
+      if (pipe_stdin)
 	{
 	  fds[0] = move_fd_to_non_stdio(pamh, fds[0]);
 	  close(fds[1]);
@@ -332,7 +346,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 
       /* Set up stdin. */
 
-      if (expose_authtok)
+      if (pipe_stdin)
 	{
 	  /* reopen stdin as pipe */
 	  if (dup2(fds[0], STDIN_FILENO) == -1)
