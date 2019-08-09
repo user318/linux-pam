@@ -403,7 +403,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	      pam_error (pamh, _("%s failed: unknown status 0x%x"),
 			 argv[optargc], status);
 	    }
-	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;;
+	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
 	}
       return was_error;
     }
