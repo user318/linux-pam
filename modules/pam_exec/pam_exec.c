@@ -242,6 +242,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
     {
       int status = 0;
       pid_t rc;
+      int was_error = PAM_SUCCESS;
 
       if (use_stdout)
         close(stdout_fds[1]);
@@ -251,8 +252,12 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	  if (debug)
 	    pam_syslog (pamh, LOG_DEBUG, "send password to child");
 	  if (write(fds[1], authtok, strlen(authtok)) == -1)
-	    pam_syslog (pamh, LOG_ERR,
-			      "sending password to child failed: %m");
+            {
+              pam_syslog (pamh, LOG_ERR,
+                                "sending password to child failed: %m");
+              was_error = PAM_SYSTEM_ERR;
+              goto finish;
+            }
 
           close(fds[0]);       /* close here to avoid possible SIGPIPE above */
           close(fds[1]);
@@ -269,10 +274,17 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 		buf[len-1] = '\0';
 	      pam_info(pamh, "%s", buf);
 	    }
-	  fclose(stdout_file);
 	}
 
-      if (pipe_stdin && !expose_authtok) /* expose_authtok closes fds above */
+      finish:
+
+      if (was_error != PAM_SUCCESS) /* kill child in case of error */
+        kill(pid, SIGTERM);
+
+      if (use_stdout)
+        fclose(stdout_file);
+
+      if (pipe_stdin)
         {
           close(fds[0]);       /* close here to avoid possible SIGPIPE above */
           close(fds[1]);
@@ -283,7 +295,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       if (rc == (pid_t)-1)
 	{
 	  pam_syslog (pamh, LOG_ERR, "waitpid returns with -1: %m");
-	  return PAM_SYSTEM_ERR;
+	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
 	}
       else if (status != 0)
 	{
@@ -294,6 +306,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 		if (!quiet)
 	      pam_error (pamh, _("%s failed: exit code %d"),
 			 argv[optargc], WEXITSTATUS(status));
+              was_error = PAM_PERM_DENIED;
 	    }
 	  else if (WIFSIGNALED(status))
 	    {
@@ -313,9 +326,9 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	      pam_error (pamh, _("%s failed: unknown status 0x%x"),
 			 argv[optargc], status);
 	    }
-	  return PAM_SYSTEM_ERR;
+	  return was_error == PAM_SUCCESS ? PAM_SYSTEM_ERR : was_error;
 	}
-      return PAM_SUCCESS;
+      return was_error;
     }
   else /* child */
     {
