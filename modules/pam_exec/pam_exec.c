@@ -101,6 +101,7 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
   int quiet = 0;
   int expose_authtok = 0;
   int use_stdout = 0;
+  int use_interactive = 0;
   int pipe_stdin = 0;
   int optargc;
   const char *logfile = NULL;
@@ -129,6 +130,8 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	debug = 1;
       else if (strcasecmp (argv[optargc], "stdout") == 0)
 	use_stdout = 1;
+      else if (strcasecmp (argv[optargc], "interactive") == 0)
+	use_interactive = 1;
       else if ((str = pam_str_skip_icase_prefix (argv[optargc], "log=")) != NULL)
 	logfile = str;
       else if ((str = pam_str_skip_icase_prefix (argv[optargc], "type=")) != NULL)
@@ -154,6 +157,29 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
       if (retval == PAM_CONV_AGAIN)
         retval = PAM_INCOMPLETE;
       return retval;
+    }
+
+  if (use_interactive)
+    {
+      if (strcmp (pam_type, "auth") != 0)
+        {
+          pam_syslog (pamh, LOG_ERR,
+                      "interactive not supported for type %s", pam_type);
+          use_interactive = 0;
+        }
+      else if (expose_authtok)
+        {
+          pam_syslog (pamh, LOG_ERR,
+                      "interactive is not compatible with expose_authtok");
+          use_interactive = 0;
+        }
+      else if (!use_stdout)
+        {
+          pam_syslog (pamh, LOG_ERR, "interactive requires stdout mode");
+          use_interactive = 0;
+        }
+      else
+        pipe_stdin = 1;
     }
 
   if (expose_authtok == 1)
@@ -270,8 +296,60 @@ call_exec (const char *pam_type, pam_handle_t *pamh,
 	    {
 	      size_t len;
 	      len = strlen(buf);
-	      if (buf[len-1] == '\n')
-		buf[len-1] = '\0';
+
+	      if (buf[len-1] != '\n')
+                {
+                  pam_syslog (pamh, LOG_ERR, "message from child is too long");
+                  was_error = PAM_SYSTEM_ERR;
+                  goto finish;
+                }
+
+              buf[len-1] = '\0';
+
+              /* if string begins with "<<" - child asks for prompt */
+              if (use_interactive && buf[0] == '<' && buf[1] == '<')
+                {
+                  char *resp = NULL;
+
+                  if (debug)
+                    pam_syslog (pamh, LOG_DEBUG, "child asked for prompt");
+
+                  retval = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF,
+                                       &resp, "%s", buf+2);
+
+                  if (retval != PAM_SUCCESS)
+                    {
+                      _pam_drop (resp);
+                      if (retval == PAM_CONV_AGAIN)
+                        was_error = PAM_PERM_DENIED;
+                      else
+                        was_error = retval;
+                      goto finish;
+                    }
+
+                  if (!resp)
+                    {
+                      was_error = PAM_PERM_DENIED;
+                      goto finish;
+                    }
+
+                  if (debug)
+                    pam_syslog (pamh, LOG_DEBUG, "send response to child: %s", resp);
+
+                  if (write(fds[1], resp, strlen(resp)) == -1 ||
+                      write(fds[1], "\n", 1) == -1)
+                    {
+                      _pam_drop (resp);
+                      pam_syslog (pamh, LOG_ERR,
+                                  "sending response to child failed: %m");
+                      was_error = PAM_SYSTEM_ERR;
+                      goto finish;
+                    }
+
+                  _pam_drop (resp);
+                  continue;
+                }
+
 	      pam_info(pamh, "%s", buf);
 	    }
 	}
